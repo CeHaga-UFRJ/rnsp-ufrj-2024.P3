@@ -3,6 +3,7 @@ import wisardpkg as wp
 from abc import ABC, abstractmethod
 from collections import deque
 import random
+from enum import Enum
 
 class GameEnvironment(ABC):
     @abstractmethod
@@ -24,6 +25,172 @@ class GameEnvironment(ABC):
     @abstractmethod
     def get_reward(self):
         pass
+
+class Direction(Enum):
+    UP = 0
+    RIGHT = 1
+    DOWN = 2
+    LEFT = 3
+
+    def rotate(direction, rotation, symmetry):
+        rotate = Direction((direction.value - rotation) % 4)
+        if symmetry:
+            if rotate == Direction.LEFT:
+                rotate = Direction.RIGHT
+            elif rotate == Direction.RIGHT:
+                rotate = Direction.LEFT
+        return rotate
+
+class Game2048(GameEnvironment):
+    def __init__(self, size=4, initial_pieces=2, base=2):
+        self.size = size
+        self.board = [[0 for _ in range(size)] for _ in range(size)]
+        self.game_ended = False
+        self.rounds = 0
+        self.score = 0
+        for _ in range(initial_pieces):
+            self.random_piece()
+
+    def get_state(self):
+        return np.array(self.board).flatten()
+    
+    def get_valid_actions(self):
+        valid_actions = set()
+        for direction in Direction:
+            for i in range(self.size):
+                for j in range(self.size):
+                    if i < self.size - 1:
+                        if direction == Direction.UP and self.board[i][j] == self.board[i + 1][j]:
+                            valid_actions.add(direction)
+                        elif direction == Direction.DOWN and self.board[i][j] == self.board[i + 1][j]:
+                            valid_actions.add(direction)
+                        
+                        if direction == Direction.UP and self.board[i][j] == 0 and self.board[i + 1][j] != 0:
+                            valid_actions.add(direction)
+                        elif direction == Direction.DOWN and self.board[i][j] == 0 and self.board[i + 1][j] != 0:
+                            valid_actions.add(direction)
+                    if j < self.size - 1:
+                        if direction == Direction.LEFT and self.board[i][j] == self.board[i][j + 1]:
+                            valid_actions.add(direction)
+                        elif direction == Direction.RIGHT and self.board[i][j] == self.board[i][j + 1]:
+                            valid_actions.add(direction)
+
+                        if direction == Direction.LEFT and self.board[i][j] == 0 and self.board[i][j + 1] != 0:
+                            valid_actions.add(direction)
+                        elif direction == Direction.RIGHT and self.board[i][j] == 0 and self.board[i][j + 1] != 0:
+                            valid_actions.add(direction)
+        return list(valid_actions)
+
+    def random_piece(self):
+        piece = 1 if random.randint(0, 9) < 9 else 2
+        empty_cells = [(i, j) for i in range(self.size) for j in range(self.size) if self.board[i][j] == 0]
+        if not empty_cells: return None
+        i, j = empty_cells[random.randint(0, len(empty_cells) - 1)]
+        self.board[i][j] = piece
+        return {
+            "piece": piece,
+            "position": (i, j)
+        }
+
+    def make_move(self, direction):
+        self.rounds += 1
+        new_score = 0
+        new_board = None
+
+        if direction == Direction.UP:
+            new_board, new_score = self.move_up()
+        elif direction == Direction.DOWN:
+            new_board, new_score = self.move_down()
+        elif direction == Direction.LEFT:
+            new_board, new_score = self.move_left()
+        elif direction == Direction.RIGHT:
+            new_board, new_score = self.move_right()
+
+        self.board = new_board
+        self.score += new_score
+        new_piece = self.random_piece()
+
+        return self.board
+
+    def move_up(self):
+        new_board = [[0 for _ in range(self.size)] for _ in range(self.size)]
+        new_score = 0
+        for j in range(self.size):
+            pieces = [piece[j] for piece in self.board if piece[j] != 0]
+            merged_pieces, current_score = self.merge_pieces(pieces)
+            new_score += current_score
+            for i in range(self.size):
+                new_board[i][j] = merged_pieces[i]
+        return new_board, new_score
+
+    def move_down(self):
+        new_board = [[0 for _ in range(self.size)] for _ in range(self.size)]
+        new_score = 0
+        for j in range(self.size):
+            pieces = [piece[j] for piece in self.board if piece[j] != 0]
+            merged_pieces, current_score = self.merge_pieces(pieces, inverse=True)
+            new_score += current_score
+            for i in range(self.size):
+                new_board[i][j] = merged_pieces[i]
+        return new_board, new_score
+
+    def move_right(self):
+        new_board = [[0 for _ in range(self.size)] for _ in range(self.size)]
+        new_score = 0
+        for i in range(self.size):
+            pieces = [piece for piece in self.board[i] if piece != 0]
+            merged_pieces, current_score = self.merge_pieces(pieces, inverse=True)
+            new_board[i] = merged_pieces
+            new_score += current_score
+        return new_board, new_score
+
+    def move_left(self):
+        new_board = [[0 for _ in range(self.size)] for _ in range(self.size)]
+        new_score = 0
+        for i in range(self.size):
+            pieces = [piece for piece in self.board[i] if piece != 0]
+            merged_pieces, current_score = self.merge_pieces(pieces)
+            new_board[i] = merged_pieces
+            new_score += current_score
+        return new_board, new_score
+
+    def merge_pieces(self, pieces, inverse=False):
+        merged_pieces = []
+        new_score = 0
+        i = 0
+
+        if inverse:
+            pieces = pieces[::-1]
+
+        while i < len(pieces):
+            if i < len(pieces) - 1 and pieces[i] == pieces[i + 1]:
+                new_piece = pieces[i] + 1
+                merged_pieces.append(new_piece)
+                new_score += 2**new_piece
+                i += 2
+            else:
+                merged_pieces.append(pieces[i])
+                i += 1
+
+        remaining = self.size - len(merged_pieces)
+        merged_pieces += [0] * remaining
+
+        if inverse:
+            merged_pieces = merged_pieces[::-1]
+
+        return merged_pieces, new_score
+
+    def get_reward(self):
+        return self.score
+    
+    def is_game_over(self):
+        return not self.get_valid_actions()
+
+    def __str__(self):
+        board_str = ""
+        for row in self.board:
+            board_str += " ".join(map(str, row)) + "\n"
+        return board_str
 
 class TicTacToe(GameEnvironment):
     def __init__(self):
@@ -127,7 +294,8 @@ class WisardDQN:
         print(state_bin)
         print(self.preprocess_board(state_bin))
         print(classification)
-        return {int(result['class']): result['confidence'] for result in classification}
+        return {int(result['class']): result['confidence'] for result in classification if result['class']}
+        
     
     def act(self, state, valid_actions):
         if random.random() <= self.epsilon:
