@@ -1,7 +1,5 @@
 import numpy as np
-import torch
-from torch import nn
-import torch_dwn as dwn
+import wisardpkg as wp
 from abc import ABC, abstractmethod
 from collections import deque
 import random
