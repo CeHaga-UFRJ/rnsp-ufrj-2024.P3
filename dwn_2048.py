@@ -166,22 +166,22 @@ class Game2048(GameEnvironment):
     def get_reward(self):
         reward = 0
         
+        # Larger reward for higher tiles
         if self.max_tile > self.previous_max_tile:
-            if self.previous_max_tile == 0:
-                reward += 2.0
-            else:
-                reward += 2.0 * (np.log2(self.max_tile) - np.log2(self.previous_max_tile))
+            reward += 2.0 * np.log2(self.max_tile)
         
-        if self.moves_since_merge > 5:
-            reward -= 0.5 * (self.moves_since_merge - 5)
-        
+        # Bonus for maintaining empty tiles
         empty_tiles = self.get_empty_tiles()
-        reward += 0.1 * empty_tiles
+        reward += 0.5 * empty_tiles
         
-        reward += 0.2 * self.get_monotonicity()
-        reward += 0.1 * self.get_smoothness()
+        # Stronger penalty for stagnation
+        if self.moves_since_merge > 3:
+            reward -= 1.0 * (self.moves_since_merge - 3)
         
-        return float(reward)  # Ensure we return a number
+        # Add monotonicity reward
+        reward += 0.3 * self.get_monotonicity()
+        
+        return float(reward)
     
     def get_max_tile(self):
         return np.max(self.board)
@@ -316,13 +316,13 @@ class QLearningAgent:
         self.action_size = action_size
         # Memory buffer size - how many experiences we store for replay
         # Larger values (like 20000) help maintain diverse experiences for learning
-        self.memory = deque(maxlen=20000)
-        self.gamma = 0.95 # Discount factor for future rewards (0 to 1)
-        self.epsilon = 1.0 # Initial exploration rate (start at 100% random moves)
-        self.epsilon_min = 0.01 # This is the minimum value epsilon can reach. And it is the percentage of chance of making random moves
-        self.epsilon_decay = 0.995 # This controls how fast epsilon decreases. 0.99 for faster decay or 0.999 for slower. Slower decay allows better exploration
-        self.batch_size = 128  # Increased for better GPU utilization
-        self.learning_rate = 0.001 # How fast the model learns
+        self.memory = deque(maxlen=100000)  # Larger memory for better learning
+        self.gamma = 0.99  # Increase future reward importance
+        self.epsilon = 1.0
+        self.epsilon_min = 0.05  # Higher minimum exploration
+        self.epsilon_decay = 0.997  # Slower decay
+        self.batch_size = 64  # Smaller batch for more frequent updates
+        self.learning_rate = 0.0005  # Lower learning rate for stability
         
         # Model definition
         self.model = nn.Sequential(
