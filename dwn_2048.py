@@ -9,9 +9,8 @@ import seaborn as sns
 import time
 import os
 from datetime import datetime
-from typing import List, Tuple, Dict
+from typing import List
 from abc import ABC, abstractmethod
-import heapq
 
 # Define the abstract base class that was missing
 class GameEnvironment(ABC):
@@ -295,196 +294,85 @@ class MetricsTracker:
                        f"{self.episode_steps[i]},{self.episode_times[i]:.2f}\n")
         print(f"Numerical data saved as: {data_filepath}")
 
-class PrioritizedReplayBuffer:
-    def __init__(self, maxlen=20000, alpha=0.6, beta=0.4):
-        self.maxlen = maxlen
-        self.memory = deque(maxlen=maxlen)
-        self.priorities = deque(maxlen=maxlen)
-        self.alpha = alpha      # Priority exponent
-        self.beta = beta        # Importance sampling weight
-        self.epsilon = 1e-6     # Small constant to avoid zero probabilities
-        
-    def add(self, state, action, reward, next_state, done):
-        # New experiences get max priority
-        max_priority = max(self.priorities) if self.priorities else 1.0
-        self.memory.append((state, action, reward, next_state, done))
-        self.priorities.append(max_priority)
-        
-        # Maintain maxlen
-        if len(self.memory) > self.maxlen:
-            self.memory.popleft()
-            self.priorities.popleft()
-    
-    def sample(self, batch_size):
-        total = len(self.memory)
-        
-        # Calculate sampling probabilities
-        probs = np.array(self.priorities) ** self.alpha
-        probs /= probs.sum()
-        
-        # Sample indices and calculate importance weights
-        indices = np.random.choice(total, batch_size, p=probs)
-        samples = [self.memory[idx] for idx in indices]
-        
-        # Calculate importance sampling weights
-        weights = (total * probs[indices]) ** (-self.beta)
-        weights /= weights.max()  # Normalize weights
-        
-        return samples, indices, weights
-    
-    def update_priorities(self, indices, errors):
-        for idx, error in zip(indices, errors):
-            self.priorities[idx] = error.item() + self.epsilon
-    
-    def __len__(self):
-        return len(self.memory)
-
-class DWNQLearningAgent:
+class QLearningAgent:
     def __init__(self, state_size, action_size):
+        # Check GPU availability and properties
         if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is not available")
+            raise RuntimeError("CUDA is not available. Please check your GPU installation.")
         
         self.device = torch.device("cuda")
-        print(f"\nGPU: {torch.cuda.get_device_name(0)}")
+        
+        # Print GPU info
+        print("\n=== GPU Information ===")
+        print(f"GPU Device: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory Allocated: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
+        print(f"GPU Memory Cached: {torch.cuda.memory_reserved(0) / 1024**2:.2f} MB")
+        print("=====================\n")
+        
+        # Enable cuDNN auto-tuner for best performance
         torch.backends.cudnn.benchmark = True
         
-        # Core parameters
         self.state_size = state_size
         self.action_size = action_size
-        self.memory = PrioritizedReplayBuffer(maxlen=50000)
-        self.gamma = 0.95
-        self.epsilon = 1.0
-        self.epsilon_min = 0.05
-        self.epsilon_decay = 0.997
-        self.batch_size = 128
-        self.learning_rate = 0.001
-        self.tau = 0.005  # Soft update parameter
+        # Memory buffer size - how many experiences we store for replay
+        # Larger values (like 20000) help maintain diverse experiences for learning
+        self.memory = deque(maxlen=20000)
+        self.gamma = 0.95 # Discount factor for future rewards (0 to 1)
+        self.epsilon = 1.0 # Initial exploration rate (start at 100% random moves)
+        self.epsilon_min = 0.01 # This is the minimum value epsilon can reach. And it is the percentage of chance of making random moves
+        self.epsilon_decay = 0.995 # This controls how fast epsilon decreases. 0.99 for faster decay or 0.999 for slower. Slower decay allows better exploration
+        self.batch_size = 128  # Increased for better GPU utilization
+        self.learning_rate = 0.001 # How fast the model learns
         
-        # Curriculum learning
-        self.curriculum_stage = 0
-        self.stage_thresholds = {
-            0: 0,     # Initial stage
-            1: 256,   # Basic merging
-            2: 512,   # Advanced merging
-            3: 1024,  # Expert merging
-            4: 2048   # Master level
-        }
+        # Model definition
+        self.model = nn.Sequential(
+            nn.Linear(state_size, 128),
+            nn.ReLU(),
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, action_size)
+        ).to(self.device)  # Move model to GPU
         
-        # Build networks
-        self.policy_net = self._build_model()
-        self.target_net = self._build_model()
-        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        self.criterion = nn.MSELoss()
         
-        self.optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=self.learning_rate)
-        self.criterion = nn.MSELoss(reduction='none')  # For prioritized replay
-        
-        # Metrics
+        # Learning metrics
         self.losses = []
         self.avg_q_values = []
         self.action_frequencies = {i: 0 for i in range(action_size)}
-        self.stage_history = []
         
-    def _build_model(self):
-        model = nn.Sequential(
-            # Input preprocessing
-            nn.Linear(self.state_size, self.state_size * 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            
-            # First DWN block
-            dwn.LUTLayer(self.state_size * 2, 256, n=4, mapping='learnable'),
-            nn.LayerNorm(256),  # Replace BatchNorm with LayerNorm
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            
-            # Second DWN block
-            dwn.LUTLayer(256, 128, n=4, mapping='learnable'),
-            nn.LayerNorm(128),  # Replace BatchNorm with LayerNorm
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            
-            # Third DWN block
-            dwn.LUTLayer(128, 64, n=4, mapping='learnable'),
-            nn.LayerNorm(64),   # Replace BatchNorm with LayerNorm
-            nn.ReLU(),
-            
-            # Output layer
-            nn.Linear(64, self.action_size)
-        ).to(self.device)
-        
-        # Initialize weights
-        def init_weights(m):
-            if isinstance(m, nn.Linear):
-                torch.nn.init.kaiming_uniform_(m.weight)
-                if m.bias is not None:
-                    torch.nn.init.zeros_(m.bias)
-        
-        model.apply(init_weights)
-        return model
-    
-    def update_curriculum(self, max_tile):
-        """Update curriculum stage based on maximum tile achieved"""
-        for stage, threshold in sorted(self.stage_thresholds.items(), reverse=True):
-            if max_tile >= threshold and stage > self.curriculum_stage:
-                self.curriculum_stage = stage
-                break
-    
-    def get_exploration_rate(self):
-        """Get curriculum-adjusted exploration rate"""
-        base_epsilon = max(self.epsilon, self.epsilon_min)
-        stage_bonus = 0.05 * (4 - self.curriculum_stage)  # More exploration in early stages
-        return min(base_epsilon + stage_bonus, 1.0)
-    
+        # GPU Memory tracking
+        self.track_gpu_memory = True
+
     def preprocess_state(self, state):
-        """Enhanced state preprocessing with curriculum-based normalization and proper type handling"""
-        try:
-            # Ensure state is a numpy array
-            if isinstance(state, (float, np.float64, np.float32)):
-                state = np.array([state], dtype=np.float32)
-            else:
-                state = np.array(state, dtype=np.float32)
-            
-            # Reshape if needed
-            if state.ndim == 1:
-                state = state.reshape(-1)
-            
-            non_zero_mask = state > 0
-            processed_state = np.zeros_like(state, dtype=np.float32)
-            processed_state[non_zero_mask] = np.log2(state[non_zero_mask])
-            
-            # Curriculum-based normalization
-            norm_factor = 11.0  # log2(2048)
-            if self.curriculum_stage < 2:
-                norm_factor = 8.0  # log2(256)
-            elif self.curriculum_stage < 3:
-                norm_factor = 9.0  # log2(512)
-            
-            if processed_state.max() > 0:
-                processed_state = processed_state / norm_factor
-            
-            # Convert to tensor with proper shape
-            tensor_state = torch.FloatTensor(processed_state).view(1, -1)
-            return tensor_state.to(self.device)
+        """Preprocess state and ensure it's on GPU"""
+        state_array = np.array(state, dtype=np.float32)
+        non_zero_mask = state_array > 0
+        processed_state = np.zeros_like(state_array)
+        processed_state[non_zero_mask] = np.log2(state_array[non_zero_mask])
+        if processed_state.max() > 0:
+            processed_state = processed_state / 11.0
         
-        except Exception as e:
-            print(f"State preprocessing error: {str(e)}")
-            print(f"State type: {type(state)}")
-            print(f"State value: {state}")
-            raise
-    
+        # Move to GPU directly
+        return torch.FloatTensor(processed_state).view(1, -1).to(self.device, non_blocking=True)
+
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, bool(done)))
+
     def act(self, state, valid_actions):
         if not valid_actions:
             return None
         
-        # Use curriculum-adjusted exploration rate
-        if random.random() <= self.get_exploration_rate():
+        if random.random() <= self.epsilon:
             action = random.choice(valid_actions)
             self.action_frequencies[action] += 1
             return action
         
         with torch.no_grad():
             state = self.preprocess_state(state)
-            q_values = self.policy_net(state).cpu()
+            q_values = self.model(state).cpu()
             self.avg_q_values.append(q_values.mean().item())
             
             # Mask invalid actions
@@ -495,253 +383,148 @@ class DWNQLearningAgent:
             action = masked_q_values.argmax().item()
             self.action_frequencies[action] += 1
             return action
-    
-    def remember(self, state, action, reward, next_state, done):
-        self.memory.add(state, action, reward, next_state, done)
-    
+
     def replay(self):
         if len(self.memory) < self.batch_size:
             return None
         
-        try:
-            # Sample with priorities
-            samples, indices, weights = self.memory.sample(self.batch_size)
-            weights = torch.FloatTensor(weights).to(self.device)
-            
-            # Prepare batch data with proper type handling
-            states = torch.cat([self.preprocess_state(np.array(state)) 
-                            for state, *_ in samples])
-            actions = torch.tensor([action for _, action, *_ in samples], 
-                                device=self.device, dtype=torch.long).view(-1, 1)
-            rewards = torch.tensor([reward for _, _, reward, *_ in samples], 
-                                device=self.device, dtype=torch.float32)
-            next_states = torch.cat([self.preprocess_state(np.array(next_state)) 
-                                for _, _, _, next_state, _ in samples])
-            dones = torch.tensor([float(done) for _, _, _, _, done in samples], 
+        # Track GPU memory before batch processing
+        if self.track_gpu_memory:
+            before_memory = torch.cuda.memory_allocated() / 1024**2
+        
+        minibatch = random.sample(self.memory, self.batch_size)
+        
+        # Process entire batch at once and move to GPU
+        states = torch.cat([self.preprocess_state(state[0]) for state in minibatch])
+        actions = torch.tensor([state[1] for state in minibatch], 
+                            device=self.device, dtype=torch.long).view(-1, 1)
+        rewards = torch.tensor([state[2] for state in minibatch], 
                             device=self.device, dtype=torch.float32)
-            
-            # Compute Q values without autocast
-            self.optimizer.zero_grad()
-            
-            # Forward pass with policy network
-            current_q_values = self.policy_net(states).gather(1, actions).squeeze()
+        next_states = torch.cat([self.preprocess_state(state[3]) for state in minibatch])
+        dones = torch.tensor([float(state[4]) for state in minibatch], 
+                        device=self.device, dtype=torch.float32)
+        
+        # Compute Q-values efficiently on GPU
+        self.optimizer.zero_grad()
+        with torch.amp.autocast('cuda'):  # Updated autocast usage
+            current_q_values = self.model(states).gather(1, actions).squeeze()
             
             with torch.no_grad():
-                next_q_values = self.target_net(next_states).max(1)[0]
-                target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
+                next_q_values = self.model(next_states)
+                next_q_max = next_q_values.max(1)[0]
+                target_q_values = rewards + (1 - dones) * self.gamma * next_q_max
             
-            # Compute weighted loss for prioritized replay
-            elementwise_loss = self.criterion(current_q_values, target_q_values)
-            weighted_loss = (elementwise_loss * weights).mean()
-            
-            weighted_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=1.0)
-            self.optimizer.step()
-            
-            # Update target network with soft update
-            with torch.no_grad():
-                for target_param, policy_param in zip(self.target_net.parameters(), 
-                                                    self.policy_net.parameters()):
-                    target_param.data.copy_(
-                        self.tau * policy_param.data + (1 - self.tau) * target_param.data
-                    )
-            
-            # Update priorities
-            self.memory.update_priorities(indices, elementwise_loss)
-            
-            # Update exploration rate
-            if self.epsilon > self.epsilon_min:
-                self.epsilon *= self.epsilon_decay
-            
-            loss_value = weighted_loss.item()
-            self.losses.append(loss_value)
-            
-            return loss_value
-            
-        except Exception as e:
-            print(f"Replay error: {str(e)}")
-            print(f"Sample types:")
-            for i, (state, action, reward, next_state, done) in enumerate(samples[:5]):
-                print(f"Sample {i}:")
-                print(f"  State type: {type(state)}, shape: {np.array(state).shape}")
-                print(f"  Action type: {type(action)}")
-                print(f"  Reward type: {type(reward)}")
-                print(f"  Next state type: {type(next_state)}, shape: {np.array(next_state).shape}")
-                print(f"  Done type: {type(done)}")
-            raise
-    
+            loss = self.criterion(current_q_values, target_q_values)
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        self.optimizer.step()
+        
+        # Track GPU memory after batch processing
+        if self.track_gpu_memory:
+            after_memory = torch.cuda.memory_allocated() / 1024**2
+            if after_memory - before_memory > 100:  # If memory increased by more than 100MB
+                print(f"\nWarning: Large GPU memory increase: {after_memory - before_memory:.2f}MB")
+        
+        # Clear GPU cache periodically
+        if len(self.losses) % 1000 == 0:
+            torch.cuda.empty_cache()
+        
+        loss_value = loss.item()
+        self.losses.append(loss_value)
+        
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+        
+        return loss_value
+
     def get_learning_metrics(self):
-        return {
+        """Return current learning metrics with GPU memory info"""
+        metrics = {
             'avg_loss': np.mean(self.losses[-100:]) if self.losses else 0,
             'avg_q_value': np.mean(self.avg_q_values[-100:]) if self.avg_q_values else 0,
             'action_distribution': {k: v/sum(self.action_frequencies.values()) 
-                                  for k, v in self.action_frequencies.items()},
+                                for k, v in self.action_frequencies.items()},
             'epsilon': self.epsilon,
-            'curriculum_stage': self.curriculum_stage,
             'gpu_memory_used': f"{torch.cuda.memory_allocated() / 1024**2:.2f}MB",
             'gpu_memory_cached': f"{torch.cuda.memory_reserved() / 1024**2:.2f}MB"
         }
+        return metrics
 
-def enhanced_reward_function(env, agent):
-    """Enhanced reward function that scales with curriculum stage"""
-    base_reward = env.get_reward()  # Get basic reward from environment
-    
-    # Curriculum stage bonuses
-    stage_multiplier = 1.0 + (0.2 * agent.curriculum_stage)
-    
-    # Additional rewards based on game state
-    monotonicity_reward = env.get_monotonicity() * (0.2 + 0.1 * agent.curriculum_stage)
-    smoothness_reward = env.get_smoothness() * (0.1 + 0.05 * agent.curriculum_stage)
-    empty_tiles_reward = env.get_empty_tiles() * (0.3 - 0.05 * agent.curriculum_stage)
-    
-    # Merge rewards
-    merge_reward = 0
-    if env.merge_count > 0:
-        merge_reward = 0.5 * env.merge_count * stage_multiplier
-    
-    # Penalty for moves without merges
-    stagnation_penalty = -0.2 * env.moves_since_merge if env.moves_since_merge > 3 else 0
-    
-    total_reward = (
-        base_reward * stage_multiplier +
-        monotonicity_reward +
-        smoothness_reward +
-        empty_tiles_reward +
-        merge_reward +
-        stagnation_penalty
-    )
-    
-    return float(total_reward)
-
-def train(episodes=1000, log_interval=25, save_interval=100):
+def train(episodes=100, log_interval=1):
     print("\n=== Training Configuration ===")
     print(f"Episodes: {episodes}")
-    print(f"Log Interval: {log_interval}")
-    print(f"Save Interval: {save_interval}")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print("============================\n")
     
     env = Game2048()
-    agent = DWNQLearningAgent(16, 4)
+    agent = QLearningAgent(16, 4)
     metrics = MetricsTracker()
     
     best_score = 0
     best_tile = 0
-    running_scores = deque(maxlen=100)
     
-    checkpoint_dir = 'checkpoints'
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    try:
-        for episode in range(episodes):
-            env = Game2048()
-            state = env.get_state()
-            total_reward = 0
-            steps = 0
-            start_time = time.time()
+    for episode in range(episodes):
+        env = Game2048()
+        state = env.get_state()
+        total_reward = 0
+        steps = 0
+        start_time = time.time()
+        
+        while not env.is_game_over() and not env.is_won():
+            valid_actions = env.get_valid_actions()
+            action = agent.act(state, valid_actions)
             
-            while not env.is_game_over() and not env.is_won():
-                valid_actions = env.get_valid_actions()
-                action = agent.act(state, valid_actions)
-                
-                if action is None:
-                    break
-                
-                env.make_move(action)
-                next_state = env.get_state()
-                reward = enhanced_reward_function(env, agent)
-                done = env.is_game_over() or env.is_won()
-                
-                agent.remember(state, action, reward, next_state, done)
-                loss = agent.replay()
-                
-                state = next_state
-                total_reward += reward
-                steps += 1
-                
-                # Update curriculum based on current max tile
-                agent.update_curriculum(env.get_max_tile())
-                
-                if steps % 10 == 0:
-                    learning_metrics = agent.get_learning_metrics()
-                    print(f"\rEpisode {episode+1}/{episodes} - Steps: {steps} "
-                          f"- Score: {env.score} - Max Tile: {env.get_max_tile()} "
-                          f"- Loss: {learning_metrics['avg_loss']:.4f} "
-                          f"- Avg Q: {learning_metrics['avg_q_value']:.4f} "
-                          f"- ε: {learning_metrics['epsilon']:.3f} "
-                          f"- Stage: {learning_metrics['curriculum_stage']}", end="")
+            if action is None:
+                break
             
-            episode_time = time.time() - start_time
-            metrics.add_episode(env.score, env.get_max_tile(), steps, episode_time)
-            running_scores.append(env.score)
+            env.make_move(action)
+            next_state = env.get_state()
+            reward = env.get_reward()
+            done = env.is_game_over() or env.is_won()
             
-            if env.score > best_score:
-                best_score = env.score
-            if env.get_max_tile() > best_tile:
-                best_tile = env.get_max_tile()
-                
-                # Save checkpoint on new best tile
-                checkpoint_path = os.path.join(checkpoint_dir, 
-                                             f'best_tile_{best_tile}_episode_{episode}.pt')
-                torch.save({
-                    'episode': episode,
-                    'model_state_dict': agent.policy_net.state_dict(),
-                    'optimizer_state_dict': agent.optimizer.state_dict(),
-                    'best_score': best_score,
-                    'best_tile': best_tile,
-                    'curriculum_stage': agent.curriculum_stage
-                }, checkpoint_path)
+            agent.remember(state, action, reward, next_state, done)
+            loss = agent.replay()
             
-            if episode % log_interval == 0:
+            state = next_state
+            total_reward += reward
+            steps += 1
+            
+            if steps % 10 == 0:
                 learning_metrics = agent.get_learning_metrics()
-                print(f"\n\nEpisode {episode+1} Summary:")
-                print(f"Score: {env.score} (Best: {best_score})")
-                print(f"Max Tile: {env.get_max_tile()} (Best: {best_tile})")
-                print(f"Steps: {steps}")
-                print(f"Average Loss: {learning_metrics['avg_loss']:.4f}")
-                print(f"Average Q-Value: {learning_metrics['avg_q_value']:.4f}")
-                print(f"Curriculum Stage: {learning_metrics['curriculum_stage']}")
-                print(f"Average Score (last 100): {np.mean(running_scores):.1f}")
-                print("Action Distribution:", 
-                      {k: f"{v:.2%}" for k, v in learning_metrics['action_distribution'].items()})
-                print("\nCurrent Board:")
-                print(env)
-                print("-" * 40)
-            
-            if episode % save_interval == 0:
-                checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_episode_{episode}.pt')
-                torch.save({
-                    'episode': episode,
-                    'model_state_dict': agent.policy_net.state_dict(),
-                    'optimizer_state_dict': agent.optimizer.state_dict(),
-                    'best_score': best_score,
-                    'best_tile': best_tile,
-                    'curriculum_stage': agent.curriculum_stage
-                }, checkpoint_path)
+                print(f"\rEpisode {episode+1}/{episodes} - Steps: {steps} - Score: {env.score} "
+                      f"- Max Tile: {env.get_max_tile()} - Loss: {learning_metrics['avg_loss']:.4f} "
+                      f"- Avg Q: {learning_metrics['avg_q_value']:.4f} - ε: {learning_metrics['epsilon']:.3f}", 
+                      end="")
         
-        metrics.plot_metrics()
+        episode_time = time.time() - start_time
+        metrics.add_episode(env.score, env.get_max_tile(), steps, episode_time)
         
-    except KeyboardInterrupt:
-        print("\nTraining interrupted by user")
-    except Exception as e:
-        print(f"\nError during training: {str(e)}")
-        raise
-    finally:
-        # Save final model
-        torch.save({
-            'episode': episodes,
-            'model_state_dict': agent.policy_net.state_dict(),
-            'optimizer_state_dict': agent.optimizer.state_dict(),
-            'best_score': best_score,
-            'best_tile': best_tile,
-            'curriculum_stage': agent.curriculum_stage
-        }, os.path.join(checkpoint_dir, 'final_model.pt'))
+        if env.score > best_score:
+            best_score = env.score
+        if env.get_max_tile() > best_tile:
+            best_tile = env.get_max_tile()
+        
+        if episode % log_interval == 0:
+            learning_metrics = agent.get_learning_metrics()
+            print(f"\n\nEpisode {episode+1} Summary:")
+            print(f"Score: {env.score} (Best: {best_score})")
+            print(f"Max Tile: {env.get_max_tile()} (Best: {best_tile})")
+            print(f"Steps: {steps}")
+            print(f"Average Loss: {learning_metrics['avg_loss']:.4f}")
+            print(f"Average Q-Value: {learning_metrics['avg_q_value']:.4f}")
+            print("Action Distribution:", 
+                  {k: f"{v:.2%}" for k, v in learning_metrics['action_distribution'].items()})
+            print("\nCurrent Board:")
+            print(env)
+            print("-" * 40)
     
+    metrics.plot_metrics()
     return agent, metrics
 
 if __name__ == "__main__":
     try:
-        agent, metrics = train(episodes=1000, log_interval=25, save_interval=100)
+        agent, metrics = train(episodes=1000, log_interval=25)
     except Exception as e:
         print(f"\nError: {str(e)}")
         raise
