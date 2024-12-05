@@ -164,22 +164,32 @@ class Game2048(GameEnvironment):
         return len(self.get_valid_actions()) == 0
     
     def get_reward(self):
+        """
+        Improved reward function that better guides learning toward winning strategies
+        """
         reward = 0
         
-        # Larger reward for higher tiles
+        # Major reward for achieving higher tiles (exponential scaling)
         if self.max_tile > self.previous_max_tile:
-            reward += 2.0 * np.log2(self.max_tile)
+            reward += 2.0 ** (np.log2(self.max_tile) - 7)  # Normalized around 128
         
-        # Bonus for maintaining empty tiles
+        # Reward for maintaining empty tiles (quadratic scaling)
         empty_tiles = self.get_empty_tiles()
-        reward += 0.5 * empty_tiles
+        reward += 0.1 * (empty_tiles ** 2)
         
-        # Stronger penalty for stagnation
+        # Penalty for moves without merges (exponential penalty)
         if self.moves_since_merge > 3:
-            reward -= 1.0 * (self.moves_since_merge - 3)
+            reward -= 2.0 ** (self.moves_since_merge - 3)
         
-        # Add monotonicity reward
-        reward += 0.3 * self.get_monotonicity()
+        # Reward for maintaining a good board structure
+        mono_score = self.get_monotonicity()
+        smooth_score = self.get_smoothness()
+        reward += 0.5 * mono_score + 0.3 * smooth_score
+        
+        # Extra reward for reaching milestone tiles
+        milestone_tiles = [128, 256, 512, 1024, 2048]
+        if self.max_tile in milestone_tiles and self.max_tile > self.previous_max_tile:
+            reward += 10.0 * np.log2(self.max_tile)
         
         return float(reward)
     
@@ -314,40 +324,61 @@ class QLearningAgent:
         
         self.state_size = state_size
         self.action_size = action_size
-        # Memory buffer size - how many experiences we store for replay
-        # Larger values (like 20000) help maintain diverse experiences for learning
-        self.memory = deque(maxlen=100000)  # Larger memory for better learning
-        self.gamma = 0.99  # Increase future reward importance
+        self.memory = deque(maxlen=50000)
+        self.gamma = 0.99
         self.epsilon = 1.0
-        self.epsilon_min = 0.05  # Higher minimum exploration
-        self.epsilon_decay = 0.997  # Slower decay
-        self.batch_size = 64  # Smaller batch for more frequent updates
-        self.learning_rate = 0.0005  # Lower learning rate for stability
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.998
+        self.batch_size = 256
+        self.learning_rate = 0.0005
         
-        # Model definition
-        self.model = nn.Sequential(
-            nn.Linear(state_size, 128),
-            nn.ReLU(),
-            nn.Linear(128, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, action_size)
-        ).to(self.device)  # Move model to GPU
+        # Create main network with layer norm instead of batch norm
+        self.model = self._build_model().to(self.device)
         
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        # Create target network
+        self.target_model = self._build_model().to(self.device)
+        self.update_target_model()
+        
+        self.optimizer = torch.optim.Adam(self.model.parameters(), 
+                                        lr=self.learning_rate,
+                                        weight_decay=1e-4)
         self.criterion = nn.MSELoss()
         
-        # Learning metrics
+        # Tracking metrics
         self.losses = []
         self.avg_q_values = []
         self.action_frequencies = {i: 0 for i in range(action_size)}
-        
-        # GPU Memory tracking
         self.track_gpu_memory = True
-
+        self.target_update_counter = 0
+        self.target_update_frequency = 10
+        
+    def _build_model(self):
+        """Builds neural network model using LayerNorm instead of BatchNorm"""
+        return nn.Sequential(
+            nn.Linear(self.state_size, 256),
+            nn.LayerNorm(256),  # LayerNorm instead of BatchNorm
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            
+            nn.Linear(256, 512),
+            nn.LayerNorm(512),  # LayerNorm instead of BatchNorm
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),  # LayerNorm instead of BatchNorm
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            
+            nn.Linear(256, self.action_size)
+        )
+    
+    def update_target_model(self):
+        """Copy weights from model to target_model"""
+        self.target_model.load_state_dict(self.model.state_dict())
+    
     def preprocess_state(self, state):
-        """Preprocess state and ensure it's on GPU"""
+        """Preprocess state with improved normalization"""
         state_array = np.array(state, dtype=np.float32)
         non_zero_mask = state_array > 0
         processed_state = np.zeros_like(state_array)
@@ -355,12 +386,14 @@ class QLearningAgent:
         if processed_state.max() > 0:
             processed_state = processed_state / 11.0
         
-        # Move to GPU directly
         return torch.FloatTensor(processed_state).view(1, -1).to(self.device, non_blocking=True)
-
+    
     def remember(self, state, action, reward, next_state, done):
-        self.memory.append((state, action, reward, next_state, bool(done)))
-
+        """Store experience with priority"""
+        # Use max priority for new experiences
+        max_priority = max([x[2] for x in self.memory]) if self.memory else 1.0
+        self.memory.append((state, action, max_priority, reward, next_state, done))
+    
     def act(self, state, valid_actions):
         if not valid_actions:
             return None
@@ -371,8 +404,11 @@ class QLearningAgent:
             return action
         
         with torch.no_grad():
+            self.model.eval()  # Set to evaluation mode
             state = self.preprocess_state(state)
             q_values = self.model(state).cpu()
+            self.model.train()  # Set back to training mode
+            
             self.avg_q_values.append(q_values.mean().item())
             
             # Mask invalid actions
@@ -388,63 +424,98 @@ class QLearningAgent:
         if len(self.memory) < self.batch_size:
             return None
         
-        # Track GPU memory before batch processing
         if self.track_gpu_memory:
             before_memory = torch.cuda.memory_allocated() / 1024**2
         
-        minibatch = random.sample(self.memory, self.batch_size)
+        # Sample batch with priorities
+        priorities = np.array([x[2] for x in self.memory])
+        probs = priorities ** 0.6  # priority_alpha
+        probs /= probs.sum()
         
-        # Process entire batch at once and move to GPU
-        states = torch.cat([self.preprocess_state(state[0]) for state in minibatch])
-        actions = torch.tensor([state[1] for state in minibatch], 
-                            device=self.device, dtype=torch.long).view(-1, 1)
-        rewards = torch.tensor([state[2] for state in minibatch], 
-                            device=self.device, dtype=torch.float32)
-        next_states = torch.cat([self.preprocess_state(state[3]) for state in minibatch])
-        dones = torch.tensor([float(state[4]) for state in minibatch], 
-                        device=self.device, dtype=torch.float32)
+        indices = np.random.choice(len(self.memory), 
+                                 self.batch_size, 
+                                 p=probs)
         
-        # Compute Q-values efficiently on GPU
+        batch = [self.memory[idx] for idx in indices]
+        
+        # Calculate importance sampling weights
+        weights = (len(self.memory) * probs[indices]) ** (-0.4)  # priority_beta
+        weights /= weights.max()
+        weights = torch.FloatTensor(weights).to(self.device)
+        
+        # Prepare batch tensors
+        states = torch.cat([self.preprocess_state(state[0]) for state in batch])
+        actions = torch.tensor([state[1] for state in batch], 
+                             device=self.device, 
+                             dtype=torch.long).view(-1, 1)
+        rewards = torch.tensor([state[3] for state in batch], 
+                             device=self.device, 
+                             dtype=torch.float32)
+        next_states = torch.cat([self.preprocess_state(state[4]) for state in batch])
+        dones = torch.tensor([float(state[5]) for state in batch], 
+                           device=self.device, 
+                           dtype=torch.float32)
+        
+        # Compute Q-values
         self.optimizer.zero_grad()
-        with torch.amp.autocast('cuda'):  # Updated autocast usage
+        
+        with torch.amp.autocast(device_type='cuda'):
             current_q_values = self.model(states).gather(1, actions).squeeze()
             
             with torch.no_grad():
-                next_q_values = self.model(next_states)
+                next_q_values = self.target_model(next_states)
                 next_q_max = next_q_values.max(1)[0]
                 target_q_values = rewards + (1 - dones) * self.gamma * next_q_max
             
-            loss = self.criterion(current_q_values, target_q_values)
+            # Compute weighted loss
+            losses = self.criterion(current_q_values, target_q_values)
+            loss = (losses * weights).mean()
         
+        # Backward pass and optimization
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
         
-        # Track GPU memory after batch processing
+        # Update priorities
+        with torch.no_grad():
+            td_errors = abs(target_q_values - current_q_values).cpu().numpy()
+        
+        for idx, error in zip(indices, td_errors):
+            self.memory[idx] = (*self.memory[idx][:2], 
+                              error + 1e-6,  # priority_epsilon
+                              *self.memory[idx][3:])
+        
+        # Track GPU memory
         if self.track_gpu_memory:
             after_memory = torch.cuda.memory_allocated() / 1024**2
-            if after_memory - before_memory > 100:  # If memory increased by more than 100MB
+            if after_memory - before_memory > 100:
                 print(f"\nWarning: Large GPU memory increase: {after_memory - before_memory:.2f}MB")
         
         # Clear GPU cache periodically
         if len(self.losses) % 1000 == 0:
             torch.cuda.empty_cache()
         
-        loss_value = loss.item()
-        self.losses.append(loss_value)
+        # Update target network if needed
+        self.target_update_counter += 1
+        if self.target_update_counter >= self.target_update_frequency:
+            self.update_target_model()
+            self.target_update_counter = 0
         
+        # Update epsilon
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
         
+        loss_value = loss.item()
+        self.losses.append(loss_value)
         return loss_value
-
+    
     def get_learning_metrics(self):
-        """Return current learning metrics with GPU memory info"""
+        """Return current learning metrics with GPU info"""
         metrics = {
             'avg_loss': np.mean(self.losses[-100:]) if self.losses else 0,
             'avg_q_value': np.mean(self.avg_q_values[-100:]) if self.avg_q_values else 0,
             'action_distribution': {k: v/sum(self.action_frequencies.values()) 
-                                for k, v in self.action_frequencies.items()},
+                                  for k, v in self.action_frequencies.items()},
             'epsilon': self.epsilon,
             'gpu_memory_used': f"{torch.cuda.memory_allocated() / 1024**2:.2f}MB",
             'gpu_memory_cached': f"{torch.cuda.memory_reserved() / 1024**2:.2f}MB"
@@ -524,7 +595,7 @@ def train(episodes=100, log_interval=1):
 
 if __name__ == "__main__":
     try:
-        agent, metrics = train(episodes=1000, log_interval=25)
+        agent, metrics = train(episodes=1000, log_interval=20)
     except Exception as e:
         print(f"\nError: {str(e)}")
         raise
